@@ -1,4 +1,3 @@
-import { sql } from "drizzle-orm";
 import * as p from "drizzle-orm/pg-core";
 
 export const projects = p.pgTable("projects", {
