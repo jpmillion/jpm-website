@@ -22,10 +22,10 @@ import { basename, extname, join } from 'node:path'
 
 import { and, eq } from 'drizzle-orm'
 import { getEncoding, type Tiktoken } from 'js-tiktoken'
-import OpenAI from 'openai'
 
 import { db, pool } from '../database/index'
 import { chunks, documents } from '../database/schema'
+import { embedBatch } from '../utils/embed'
 
 // Directory holding the source markdown. Gitignored — treated as read-only.
 const SOURCE_DIR = 'professional-experience-context'
@@ -42,18 +42,6 @@ let encoderInstance: Tiktoken | null = null
 function encoder(): Tiktoken {
   if (!encoderInstance) encoderInstance = getEncoding('cl100k_base')
   return encoderInstance
-}
-
-// OpenAI embeddings: 1536-dim vectors matching the `chunks.embedding` column.
-// The batch endpoint accepts up to 2048 inputs per request; we stay well
-// below that so progress is visible and any failure re-runs a small batch.
-const EMBEDDING_MODEL = 'text-embedding-3-small'
-const EMBEDDING_BATCH_SIZE = 128
-
-let openaiClient: OpenAI | null = null
-function openai(): OpenAI {
-  if (!openaiClient) openaiClient = new OpenAI() // reads OPENAI_API_KEY from env
-  return openaiClient
 }
 
 // One chunk-sized slice of a source document, ready for embedding.
@@ -114,7 +102,7 @@ async function ingestFile(path: string): Promise<'processed' | 'skipped'> {
   if (existing) return 'skipped'
 
   const prepared = prepareChunks(raw)
-  const embeddings = await embedChunks(prepared.map((c) => c.content))
+  const embeddings = await embedBatch(prepared.map((c) => c.content))
 
   // Upsert the document row and replace its chunks in a single transaction
   // so a partial failure can't leave orphaned or stale chunks behind.
@@ -225,31 +213,6 @@ function prepareChunks(raw: string): PreparedChunk[] {
   }
 
   return result
-}
-
-/**
- * Embeds each chunk with OpenAI `text-embedding-3-small` (1536 dims),
- * preserving input order. Issues one request per `EMBEDDING_BATCH_SIZE`
- * slice so very large documents don't exceed per-request token limits.
- */
-async function embedChunks(contents: string[]): Promise<number[][]> {
-  if (contents.length === 0) return []
-  const client = openai()
-  const embeddings: number[][] = []
-
-  for (let start = 0; start < contents.length; start += EMBEDDING_BATCH_SIZE) {
-    const batch = contents.slice(start, start + EMBEDDING_BATCH_SIZE)
-    const response = await client.embeddings.create({
-      model: EMBEDDING_MODEL,
-      input: batch,
-    })
-    // OpenAI returns embeddings in input order; the `index` field is there
-    // as a safety net in case that ever changes.
-    const sorted = [...response.data].sort((a, b) => a.index - b.index)
-    for (const item of sorted) embeddings.push(item.embedding)
-  }
-
-  return embeddings
 }
 
 /** Hex-encoded SHA-256 of the input. Used as the document content hash. */
