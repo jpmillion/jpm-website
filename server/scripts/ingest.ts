@@ -9,6 +9,8 @@
  * Idempotent: a document whose content hash already matches the DB row is
  * skipped; a changed document has its old chunks deleted and replaced.
  *
+ * Requires `OPENAI_API_KEY` plus the Postgres env vars in `.env`.
+ *
  * Run with:
  *   tsx --env-file=.env server/scripts/ingest.ts
  * or via `make ingest` (added in a later step).
@@ -19,12 +21,40 @@ import { readFile, readdir } from 'node:fs/promises'
 import { basename, extname, join } from 'node:path'
 
 import { and, eq } from 'drizzle-orm'
+import { getEncoding, type Tiktoken } from 'js-tiktoken'
+import OpenAI from 'openai'
 
 import { db, pool } from '../database/index'
 import { chunks, documents } from '../database/schema'
 
 // Directory holding the source markdown. Gitignored — treated as read-only.
 const SOURCE_DIR = 'professional-experience-context'
+
+// Chunking budget. text-embedding-3-small accepts up to 8191 tokens per input,
+// but retrieval works best with small, focused chunks. 500 with 50-token
+// overlap keeps each chunk tight while preserving cross-chunk context.
+const MAX_TOKENS = 500
+const OVERLAP_TOKENS = 50
+
+// text-embedding-3-small uses the `cl100k_base` encoding. Loading the
+// encoding is not free (~1MB BPE table), so reuse one instance per run.
+let encoderInstance: Tiktoken | null = null
+function encoder(): Tiktoken {
+  if (!encoderInstance) encoderInstance = getEncoding('cl100k_base')
+  return encoderInstance
+}
+
+// OpenAI embeddings: 1536-dim vectors matching the `chunks.embedding` column.
+// The batch endpoint accepts up to 2048 inputs per request; we stay well
+// below that so progress is visible and any failure re-runs a small batch.
+const EMBEDDING_MODEL = 'text-embedding-3-small'
+const EMBEDDING_BATCH_SIZE = 128
+
+let openaiClient: OpenAI | null = null
+function openai(): OpenAI {
+  if (!openaiClient) openaiClient = new OpenAI() // reads OPENAI_API_KEY from env
+  return openaiClient
+}
 
 // One chunk-sized slice of a source document, ready for embedding.
 type PreparedChunk = {
@@ -120,23 +150,106 @@ async function ingestFile(path: string): Promise<'processed' | 'skipped'> {
 /**
  * Splits raw markdown into embedding-sized chunks with token counts.
  *
- * TODO (micro-step 2b): implement heading-aware + token-capped chunking
- * using `js-tiktoken`. Current stub returns the whole document as one chunk
- * with a placeholder token count so the upsert path is exercisable.
+ * Strategy:
+ *   1. Split the document on blank lines into paragraph-level segments.
+ *      Markdown headings sit on their own line and naturally become their
+ *      own segments, which keeps them next to the content they introduce.
+ *   2. Hard-split any single paragraph larger than `MAX_TOKENS` into
+ *      token-sized slices so the greedy packer always has fitting pieces.
+ *   3. Greedy-pack segments into chunks of up to `MAX_TOKENS` tokens.
+ *   4. Prepend the tail `OVERLAP_TOKENS` of the previous chunk to each
+ *      subsequent chunk so retrieval at chunk boundaries still has context.
  */
 function prepareChunks(raw: string): PreparedChunk[] {
   const trimmed = raw.trim()
   if (trimmed.length === 0) return []
-  return [{ content: trimmed, tokenCount: 0 }]
+  const enc = encoder()
+
+  // Step 1 & 2: build paragraph-level segments with their token encodings.
+  type Segment = { text: string; tokens: number[] }
+  const segments: Segment[] = []
+  const paragraphs = trimmed
+    .split(/\n{2,}/)
+    .map((p) => p.trim())
+    .filter((p) => p.length > 0)
+
+  for (const paragraph of paragraphs) {
+    const tokens = enc.encode(paragraph)
+    if (tokens.length <= MAX_TOKENS) {
+      segments.push({ text: paragraph, tokens })
+      continue
+    }
+    // Oversized paragraph — slice it into MAX_TOKENS-wide pieces.
+    for (let i = 0; i < tokens.length; i += MAX_TOKENS) {
+      const slice = tokens.slice(i, i + MAX_TOKENS)
+      segments.push({ text: enc.decode(slice), tokens: slice })
+    }
+  }
+
+  // Step 3: greedy-pack segments into chunks without overlap.
+  type Packed = { text: string; tokens: number[] }
+  const packed: Packed[] = []
+  let bufferText: string[] = []
+  let bufferTokens: number[] = []
+
+  const flush = () => {
+    if (bufferTokens.length === 0) return
+    packed.push({ text: bufferText.join('\n\n'), tokens: bufferTokens })
+    bufferText = []
+    bufferTokens = []
+  }
+
+  for (const seg of segments) {
+    if (bufferTokens.length > 0 && bufferTokens.length + seg.tokens.length > MAX_TOKENS) {
+      flush()
+    }
+    bufferText.push(seg.text)
+    bufferTokens.push(...seg.tokens)
+  }
+  flush()
+
+  // Step 4: prepend a small overlap from the previous chunk's tail.
+  const result: PreparedChunk[] = []
+  for (let i = 0; i < packed.length; i++) {
+    const current = packed[i]!
+    if (i === 0) {
+      result.push({ content: current.text, tokenCount: current.tokens.length })
+      continue
+    }
+    const overlapTokens = packed[i - 1]!.tokens.slice(-OVERLAP_TOKENS)
+    const overlapText = enc.decode(overlapTokens)
+    result.push({
+      content: `${overlapText}\n\n${current.text}`,
+      tokenCount: overlapTokens.length + current.tokens.length,
+    })
+  }
+
+  return result
 }
 
 /**
- * Embeds each chunk with OpenAI `text-embedding-3-small` (1536 dims).
- *
- * TODO (micro-step 2c): call the OpenAI embeddings API in a single batch.
+ * Embeds each chunk with OpenAI `text-embedding-3-small` (1536 dims),
+ * preserving input order. Issues one request per `EMBEDDING_BATCH_SIZE`
+ * slice so very large documents don't exceed per-request token limits.
  */
-async function embedChunks(_contents: string[]): Promise<number[][]> {
-  throw new Error('embedChunks not implemented yet — stub for micro-step 2c')
+async function embedChunks(contents: string[]): Promise<number[][]> {
+  if (contents.length === 0) return []
+  const client = openai()
+  const embeddings: number[][] = []
+
+  for (let start = 0; start < contents.length; start += EMBEDDING_BATCH_SIZE) {
+    const batch = contents.slice(start, start + EMBEDDING_BATCH_SIZE)
+    const response = await client.embeddings.create({
+      model: EMBEDDING_MODEL,
+      input: batch,
+    })
+    // OpenAI returns embeddings in input order; the `index` field is there
+    // as a safety net in case that ever changes.
+    const sorted = [...response.data].sort((a, b) => a.index - b.index)
+    for (const item of sorted) embeddings.push(item.embedding)
+  }
+
+  return embeddings
 }
 
 /** Hex-encoded SHA-256 of the input. Used as the document content hash. */
