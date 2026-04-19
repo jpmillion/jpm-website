@@ -12,7 +12,9 @@
   "dependencies": {
     "@nuxt/ui": "^4.4.0",
     "drizzle-orm": "^0.45.1",
+    "js-tiktoken": "^1.0.21",
     "nuxt": "^4.2.2",
+    "openai": "^6.34.0",
     "pg": "^8.17.2",
     "tailwindcss": "^4.1.18",
     "vue": "^3.5.27",

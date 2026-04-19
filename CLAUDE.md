@@ -25,9 +25,11 @@ make down-volumes      # stop + wipe the `my_website_pg_data` volume
 
 make db-generate       # drizzle-kit generate — emit SQL migration from schema.ts
 make db-migrate        # drizzle-kit migrate — apply pending migrations
+
+make ingest            # chunk + embed every *.md in professional-experience-context/
 ```
 
-`.env` must define `POSTGRES_HOST`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`. Both the runtime (`server/database/index.ts`) and `drizzle.config.ts` read these directly from `process.env`, so the DB container and the app share one set of credentials.
+`.env` must define `POSTGRES_HOST`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, and — for ingestion / RAG — `OPENAI_API_KEY`. Both the runtime (`server/database/index.ts`) and `drizzle.config.ts` read these directly from `process.env`, so the DB container and the app share one set of credentials.
 
 ## Architecture
 

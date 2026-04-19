@@ -24,3 +24,6 @@ logs
 !.env.example
 
 professional-experience-context/
+
+# Playwright MCP artifacts (snapshots, console logs)
+.playwright-mcp/
