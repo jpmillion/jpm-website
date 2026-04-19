@@ -8,18 +8,12 @@
  * Response body: { results: [{ content, title, sourcePath, chunkIndex, distance }] }
  */
 
-import { cosineDistance, eq } from 'drizzle-orm'
+import { clampTopK, retrieve } from '../../utils/retrieve'
 
-import { db } from '../../database/index'
-import { chunks, documents } from '../../database/schema'
-import { embedQuery } from '../../utils/embed'
-
-// Query-shape guardrails. The embedding model itself accepts up to 8191
-// tokens, but real user questions are much shorter — a hard cap keeps
-// runaway inputs from burning tokens or destabilising retrieval.
+// The embedding model itself accepts up to 8191 tokens, but real user
+// questions are much shorter — a hard cap keeps runaway inputs from
+// burning tokens or destabilising retrieval.
 const MAX_QUERY_LENGTH = 2000
-const DEFAULT_TOP_K = 6
-const MAX_TOP_K = 20
 
 export default defineEventHandler(async (event) => {
   const body = await readBody<{ query?: unknown; topK?: unknown }>(event)
@@ -34,30 +28,7 @@ export default defineEventHandler(async (event) => {
       statusMessage: `\`query\` must be <= ${MAX_QUERY_LENGTH} characters`,
     })
   }
-  const topK = clampTopK(body?.topK)
 
-  const embedding = await embedQuery(query)
-  const distance = cosineDistance(chunks.embedding, embedding)
-
-  // Ordering by the same expression lets Postgres use the HNSW cosine index.
-  const results = await db
-    .select({
-      content: chunks.content,
-      chunkIndex: chunks.chunkIndex,
-      title: documents.title,
-      sourcePath: documents.sourcePath,
-      distance,
-    })
-    .from(chunks)
-    .innerJoin(documents, eq(documents.id, chunks.documentId))
-    .orderBy(distance)
-    .limit(topK)
-
+  const results = await retrieve(query, clampTopK(body?.topK))
   return { results }
 })
-
-/** Coerces an arbitrary `topK` to an integer in [1, MAX_TOP_K]. */
-function clampTopK(raw: unknown): number {
-  if (typeof raw !== 'number' || !Number.isFinite(raw)) return DEFAULT_TOP_K
-  return Math.min(Math.max(Math.trunc(raw), 1), MAX_TOP_K)
-}
