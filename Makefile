@@ -17,6 +17,3 @@ db-generate:
 
 db-migrate:
 	pnpm drizzle-kit migrate
-
-db-seed:
-	pnpm tsx server/database/seed.ts

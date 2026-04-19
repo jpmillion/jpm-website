@@ -1,10 +1,3 @@
-import * as p from "drizzle-orm/pg-core";
-
-export const projects = p.pgTable("projects", {
-  id: p.uuid("id").defaultRandom().primaryKey(),
-  name: p.text("name").notNull(),
-  description: p.text("description"),
-  url: p.text("url"),
-  repo_url: p.text("repo_url"),
-  created_at: p.timestamp("created_at").defaultNow().notNull(),
-});
+// Drizzle schema. Add table definitions here as the app grows;
+// run `make db-generate` then `make db-migrate` after changes.
+export {};
