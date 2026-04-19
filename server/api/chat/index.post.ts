@@ -1,14 +1,22 @@
 /**
- * RAG chat endpoint (non-streaming).
+ * RAG chat endpoint (Server-Sent Events).
  *
  * Runs the same top-K retrieval as `POST /api/chat/query`, then asks
- * OpenAI `gpt-4o-mini` to answer grounded in those chunks. The model
- * is instructed to cite retrieved excerpts by their numeric index
- * (e.g. `[1]`), which the UI can map back to the titles/source paths
- * in the returned `citations` array.
+ * OpenAI `gpt-4o-mini` to answer grounded in those chunks, streaming the
+ * response back as SSE so the UI can render tokens as they arrive.
  *
- * Request body:  { query: string, history?: ChatMessage[], topK?: number }
- * Response body: { answer: string, citations: Citation[] }
+ * Request body: { query: string, history?: ChatMessage[], topK?: number }
+ *
+ * Response is `text/event-stream` with three kinds of frames:
+ *   { type: 'citations', citations: Citation[] }   — sent once, first
+ *   { type: 'token', value: string }               — one per streamed delta
+ *   { type: 'done' }                               — final frame on success
+ *   { type: 'error', message: string }             — sent instead of 'done'
+ *                                                    if generation fails
+ *
+ * The model is instructed to cite excerpts by their numeric index
+ * (e.g. `[1]`), which the UI can map back to the titles/source paths
+ * in the initial `citations` frame.
  *
  * ChatMessage = { role: 'user' | 'assistant', content: string }
  * Citation    = { index, title, sourcePath, distance }
@@ -70,19 +78,51 @@ export default defineEventHandler(async (event) => {
 
   const chunks = await retrieve(query, topK)
 
-  const completion = await openai().chat.completions.create({
-    model: CHAT_MODEL,
-    temperature: 0.2,
-    max_tokens: MAX_OUTPUT_TOKENS,
-    messages: [
-      { role: 'system', content: `${SYSTEM_PROMPT}\n\n${formatContext(chunks)}` },
-      ...history,
-      { role: 'user', content: query },
-    ],
-  })
+  // Switch into SSE mode. Headers must be set before the first write,
+  // and we only reach this line after validation + retrieval have
+  // already succeeded, so earlier failures can still use normal JSON
+  // error responses via `createError`.
+  setResponseHeader(event, 'Content-Type', 'text/event-stream; charset=utf-8')
+  setResponseHeader(event, 'Cache-Control', 'no-cache, no-transform')
+  setResponseHeader(event, 'Connection', 'keep-alive')
+  // Tells nginx (and similar proxies) not to buffer the stream.
+  setResponseHeader(event, 'X-Accel-Buffering', 'no')
 
-  const answer = completion.choices[0]?.message?.content?.trim() ?? ''
-  return { answer, citations: toCitations(chunks) }
+  const res = event.node.res
+  const write = (frame: unknown) => {
+    res.write(`data: ${JSON.stringify(frame)}\n\n`)
+  }
+
+  // Send citations up front so the UI can render source chips
+  // alongside the still-streaming answer.
+  write({ type: 'citations', citations: toCitations(chunks) })
+
+  try {
+    const stream = await openai().chat.completions.create({
+      model: CHAT_MODEL,
+      temperature: 0.2,
+      max_tokens: MAX_OUTPUT_TOKENS,
+      stream: true,
+      messages: [
+        { role: 'system', content: `${SYSTEM_PROMPT}\n\n${formatContext(chunks)}` },
+        ...history,
+        { role: 'user', content: query },
+      ],
+    })
+
+    for await (const chunk of stream) {
+      const delta = chunk.choices[0]?.delta?.content
+      if (delta) write({ type: 'token', value: delta })
+    }
+    write({ type: 'done' })
+  } catch (err) {
+    // Headers are already sent, so we can't use createError here.
+    // Surface a terminal frame and let the caller decide how to recover.
+    console.error('[chat] generation failed:', err)
+    write({ type: 'error', message: 'Generation failed' })
+  } finally {
+    res.end()
+  }
 })
 
 /**
